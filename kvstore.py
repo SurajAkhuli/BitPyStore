@@ -74,8 +74,8 @@ class KVStore:
             if expiry != 0 and time.time() > expiry:
                 continue
             # Read current value from original file
-            self.file.seek(offset)
-            json_data = self.file.readline().strip()
+            self.read_file.seek(offset)
+            json_data = self.read_file.readline().strip()
 
             length = len(json_data)
             checksum = zlib.crc32(json_data.encode())
@@ -85,7 +85,8 @@ class KVStore:
             
 
         temp_file.close()
-        self.file.close()
+        self.read_file.close()
+        self.write_file.close()
 
         # 3. Replace old file with compacted file
         os.replace(temp_filename, self.filename) 
