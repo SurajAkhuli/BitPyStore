@@ -1,5 +1,5 @@
-from kvstore import KVStore
-db = KVStore("data.log")
+from engine import KVStore
+db = KVStore("data/bitpystore.db")
 
 # # Test Step 1
 

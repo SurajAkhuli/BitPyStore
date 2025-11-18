@@ -2,10 +2,10 @@ import os
 import time 
 import json
 import zlib
-from cache import LRUCache
+from lru_cache import LRUCache
 
 class KVStore:
-    def __init__(self, filename="data.log"):
+    def __init__(self, filename="data/bitpystore.db"):
         self.filename = filename
         # open file in append mode so new writes go to end
         self.write_file = open(self.filename, "a+", buffering=1)
