@@ -1,7 +1,7 @@
 import socket
 import os
 
-from engine import KVStore
+from Engine import KVStore
 db = KVStore("data.log")
 
 HOST = "127.0.0.1"
@@ -71,10 +71,20 @@ def handle_client(client_socket):
         # PUT key value
         if cmd == "PUT":
             key = args[0]
-            value = " ".join(args[1:])  # allows spaces in value
-            db.put(key, value)          # CALL YOUR KVSTORE
+
+            # TTL only valid if it's the last two tokens: ... TTL <sec>
+            if len(args) >= 4 and args[-2].upper() == "TTL":
+                ttl = int(args[-1])
+                value = " ".join(args[1:-2])  # everything between key and TTL is value
+                db.put(key, value, ttl=ttl)
+            else:
+                # Normal PUT without TTL
+                value = " ".join(args[1:])
+                db.put(key, value)
+
             client_socket.sendall(b"OK\n")
             continue
+
 
         # GET key
         if cmd == "GET":

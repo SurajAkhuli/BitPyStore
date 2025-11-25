@@ -1,5 +1,11 @@
-from engine import KVStore
-db = KVStore("data/bitpystore.db")
+import sys
+import os
+
+# Go one folder up (to access Engine.py)
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+
+from Engine import KVStore
+db = KVStore("data/bitpystore.log")
 
 # # Test Step 1
 
@@ -42,6 +48,7 @@ db = KVStore("data/bitpystore.db")
 
 # # Test Step 5-> Testing Compaction
 # db.put("name", "suraj")
+# db.put("age", 21)
 # db.put("name", "suraj2")
 # db.put("name", "suraj3")
 
@@ -85,5 +92,17 @@ db = KVStore("data/bitpystore.db")
 # print(db.stats())
 # db.compact()
 # print(db.stats())
-print(db.stats())
-print(db.print_cache)
+# print(db.stats())
+# print(db.print_cache)
+
+
+
+
+db.put('a',1)
+db.put('a',2)
+db.put('b',10)
+db.delete('a')
+db.compact()
+# db.stats()
+# db.get('a')
+# db.get('b')

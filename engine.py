@@ -1,110 +1,245 @@
 import os
-import time 
+import time
 import json
 import zlib
 from lru_cache import LRUCache
 
+
 class KVStore:
-    def __init__(self, filename="data/bitpystore.db"):
+    def __init__(self, filename="data.log"):
         self.filename = filename
-        # open file in append mode so new writes go to end
+        
+        # Open file in append mode → all writes go to end of file (append-only log)
+        # buffering=1 → line-buffered writes → flushes on every newline, safer for durability
         self.write_file = open(self.filename, "a+", buffering=1)
         self.read_file = open(self.filename, "r", buffering=1)
-        # Computer stores writes in memory first, then writes to file later. Writes go to file immediately when \n is written (Every line is flushed)
-        # buffering=1 = write each line to file immediately.No buffering=1 = write later (not instant).
-        
+
+        # In-memory index: key -> (header_offset, json_offset, expiry)
+        # This is the same idea as Bitcask: index stays in RAM, values stay on disk.
+        self.index = {}
+        self._load_index()  # Build index from existing log at startup (crash recovery)
+
+        self.cache = LRUCache(capacity=1000)  # LRU cache for faster GETs
         self.put_count = 0
         self.delete_count = 0
         self.last_compaction_time = None
-                
-        self.index = {}   # in-memory index: key -> offset
-        self._load_index()    # load index from existing log
-        
-        self.cache = LRUCache(capacity=1000)  # cache with capacity of 1000 items
-        
 
+
+    # ----------------------------------------------------------------
+    # INDEX LOADING — Replay the log file at startup to rebuild index
+    # ----------------------------------------------------------------
     def _load_index(self):
-        """Rebuild index by scanning the log file."""
-        self.read_file.seek(0)  # move to beginning
+        """Scan the entire log file and rebuild the in-memory index.
+           This acts as crash recovery because we replay the log."""
+        self.index = {}
+        self.read_file.seek(0)
 
         while True:
+            header_offset = self.read_file.tell()  # Start position of header
+            
             header = self.read_file.readline()
             if not header:
-                break  # end of file
+                break  # End of file reached
+
+            # Header format: "<length> <checksum>"
+            parts = header.strip().split()
+            if len(parts) != 2:
+                break  # Corrupted or unexpected entry
 
             try:
-                length, checksum = map(int, header.strip().split(" "))
+                length = int(parts[0])
+                checksum = int(parts[1])
             except:
-                break  # corrupted header → stop
-            
-            offset = self.read_file.tell()    # start of JSON record
-            
+                break  # Corrupted header → stop loading further
+
+            json_offset = self.read_file.tell()  # JSON begins right after header
             json_data = self.read_file.read(length)
-            if not json_data:
-                break  # corrupted end
 
-            # verify checksum
+            if len(json_data) != length:
+                break  # Truncated JSON (unexpected EOF)
+
+            # Verify checksum for corruption detection
             if zlib.crc32(json_data.encode()) != checksum:
-                break  # corrupted record
+                break
 
-            record = json.loads(json_data)
-            op = record["op"]
-            if op == "put":
-                key = record["key"]
-                expiry = record["expiry"]
-                self.index[key] = (offset, expiry)
-    
-            elif op == "delete":
-                key = record["key"]
-                self.index.pop(key, None)
-                
-            # skip newline after JSON
+            # Skip newline after JSON
             self.read_file.readline()
-                    
-    def compact(self):
-        """Compact the log file to remove old and deleted records."""
 
-        # 1. Create temp file
+            try:
+                record = json.loads(json_data)
+            except:
+                break  # Corrupted JSON
+
+            op = record["op"]
+            key = record["key"]
+
+            if op == "put":
+                expiry = record.get("expiry", 0)
+                # Index keeps offsets to header & json lines
+                self.index[key] = (header_offset, json_offset, expiry)
+
+            elif op == "delete":
+                # Delete markers remove keys from index (Bitcask tombstones)
+                self.index.pop(key, None)
+
+
+
+    # ----------------------------------------------------------------
+    # COMPACTION — rewrite only the latest versions of keys
+    # ----------------------------------------------------------------
+    def compact(self):
+        """Rewrite the log file keeping only live (latest) records.
+           Avoids log file growing forever. Works on Windows CRLF safely."""
+        
         temp_filename = self.filename + ".compact"
         temp_file = open(temp_filename, "w", buffering=1)
 
-        # 2. Write only the latest valid PUT records
-        for key, (offset, expiry) in self.index.items():
-            # skip expired keys
+        for key, (header_offset, json_offset, expiry) in self.index.items():
+            
+            # Skip expired keys
             if expiry != 0 and time.time() > expiry:
                 continue
-            # Read current value from original file
-            self.read_file.seek(offset)
-            json_data = self.read_file.readline().strip()
 
-            length = len(json_data)
-            checksum = zlib.crc32(json_data.encode())
-    
+            # Seek to the original header
+            self.read_file.seek(header_offset)
+            header = self.read_file.readline()  # Not used except to skip
+
+            # Read the JSON line fully (CRLF safe); do NOT use read(length)!
+            json_line = self.read_file.readline().rstrip("\r\n")
+
+            # Recompute fresh length & checksum for compacted file
+            length = len(json_line)
+            checksum = zlib.crc32(json_line.encode())
+
+            # Write clean, compacted entry
             temp_file.write(f"{length} {checksum}\n")
-            temp_file.write(json_data + "\n")
-            
+            temp_file.write(json_line + "\n")
 
         temp_file.close()
         self.read_file.close()
         self.write_file.close()
 
-        # 3. Replace old file with compacted file
-        os.replace(temp_filename, self.filename) 
-        # os.replace(src, dst) does: Delete dst (old file), Rename src to dst, Do it in ONE ATOMIC OPERATION, Guaranteed not to leave broken files
+        # Atomically replace old file (safe even if crash happens)
+        os.replace(temp_filename, self.filename)
 
-        # 4. Reopen file and rebuild index
+        # Reopen fresh log and reload index from the compacted file
         self.write_file = open(self.filename, "a+", buffering=1)
         self.read_file = open(self.filename, "r", buffering=1)
-        self.index = {}
-        # Why do we empty index? -> Before compaction: index contains offsets from OLD FILE. If we don’t clear index → DB will point to WRONG places → corrupted reads. So we MUST: 1)Clear index 2)Rebuild index from compacted file
         self._load_index()
-        
+
         self.last_compaction_time = time.time()
 
 
 
+    # ----------------------------------------------------------------
+    # PUT — append new value to log
+    # ----------------------------------------------------------------
+    def put(self, key, value, ttl=None):
+        # TTL stored as absolute expiry timestamp
+        expiry = int(time.time()) + ttl if ttl else 0
+        value = str(value)
+
+        # Record is stored as JSON in the log
+        record = {"op": "put", "key": key, "value": value, "expiry": expiry}
+
+        json_data = json.dumps(record)
+        length = len(json_data)
+        checksum = zlib.crc32(json_data.encode())
+
+        # Current write pointer = header position
+        header_offset = self.write_file.tell()
+
+        # HEADER WRITE
+        self.write_file.write(f"{length} {checksum}\n")
+
+        # JSON WRITE
+        self.write_file.write(json_data + "\n")
+        self.write_file.flush()  # Ensure durability
+
+        # JSON offset = header_offset + header length
+        json_offset = header_offset + len(f"{length} {checksum}\n")
+
+        # Update in-memory index
+        self.index[key] = (header_offset, json_offset, expiry)
+
+        self.cache.put(key, value)
+        self.put_count += 1
+
+
+
+    # ----------------------------------------------------------------
+    # DELETE — append a tombstone entry
+    # ----------------------------------------------------------------
+    def delete(self, key):
+        # Tombstone record (Bitcask-style delete)
+        record = {"op": "delete", "key": key}
+
+        json_data = json.dumps(record)
+        length = len(json_data)
+        checksum = zlib.crc32(json_data.encode())
+
+        header_offset = self.write_file.tell()
+
+        self.write_file.write(f"{length} {checksum}\n")
+        self.write_file.write(json_data + "\n")
+        self.write_file.flush()
+
+        # Remove from index & cache
+        self.index.pop(key, None)
+        self.cache.delete(key)
+
+        self.delete_count += 1
+
+
+
+    # ----------------------------------------------------------------
+    # GET — read latest value from disk (or cache)
+    # ----------------------------------------------------------------
+    def get(self, key):
+        if key not in self.index:
+            return None
+
+        header_offset, json_offset, expiry = self.index[key]
+
+        # TTL check
+        if expiry != 0 and time.time() > expiry:
+            self.index.pop(key, None)
+            self.cache.delete(key)
+            return None
+
+        # Cache hit → fastest path
+        cached = self.cache.get(key)
+        if cached is not None:
+            return cached
+
+        # Seek directly to the JSON offset (Bitcask principle)
+        self.read_file.seek(json_offset)
+
+        # Read JSON body using stored length from header
+        json_data = self.read_file.read(self._read_json_length(header_offset))
+
+        record = json.loads(json_data)
+        value = record["value"]
+
+        # Store in cache
+        self.cache.put(key, value)
+        return value
+
+
+    def _read_json_length(self, header_offset):
+        """Helper: read header to get JSON length."""
+        self.read_file.seek(header_offset)
+        header = self.read_file.readline().strip()
+        length, _ = map(int, header.split())
+        return length
+
+
+
+    # ----------------------------------------------------------------
+    # CLEANUP
+    # ----------------------------------------------------------------
     def close(self):
-        """Safely close the database file."""
+        """Safely close file handles."""
         if not self.write_file.closed:
             self.write_file.close()
         if not self.read_file.closed:
@@ -112,121 +247,3 @@ class KVStore:
 
     def __del__(self):
         self.close()
-        
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.close()
-
-
-
-    def put(self, key, value, ttl=None):
-        # calculate absolute expiry timestamp
-        expiry = 0
-        if ttl is not None:
-            expiry = int(time.time()) + ttl
-            
-        record = {
-            "op": "put",
-            "key": key,
-            "value": value,
-            "expiry": expiry
-        }
-            
-        json_data = json.dumps(record)
-        length = len(json_data)
-        checksum = zlib.crc32(json_data.encode())
-        # get offset before writing
-        offset = self.write_file.tell()
-
-        # write record to file
-        # header
-        self.write_file.write(f"{length} {checksum}\n")
-        # body
-        self.write_file.write(json_data + "\n")
-        self.write_file.flush()
-        # Add Optional: flush after every write (durability). Databases normally call fsync or flush file buffer.
-        
-        # store offset of JSON (not header)
-        header_len = len(f"{length} {checksum}\n")
-        self.index[key] = (offset + header_len, expiry)
-        
-        self.put_count += 1
-        self.cache.put(key, value)
-        
-
-
-    def delete(self, key):
-        # write delete record
-        record = {
-            "op": "delete",
-            "key": key
-        }
-        json_data = json.dumps(record)
-        length = len(json_data)
-        checksum = zlib.crc32(json_data.encode())
-        offset = self.write_file.tell()
-        
-        self.write_file.write(f"{length} {checksum}\n")
-        self.write_file.write(json_data + "\n")
-        self.write_file.flush()
-
-        self.delete_count += 1
-        self.cache.delete(key)
-        # remove from index
-        self.index.pop(key, None)  
-        # If key exists → deletes. If key doesn't exist → silently returns None
-
-    def get(self, key):
-        # if key not in index → no value
-        if key not in self.index:
-            return None
-
-        # jump to record offset
-        offset, expiry = self.index[key]
-        
-        # check expiry
-        # 1. TTL Check
-        if expiry != 0 and time.time() > expiry:
-            # key expired
-            del self.index[key]
-            self.cache.delete(key)
-            return None
-        
-        # 2. Cache Check first
-        cached = self.cache.get(key)
-        if cached is not None:
-            return cached
-        
-        self.read_file.seek(offset)
-    
-        # Actually, length is not needed here because we access JSON directly.
-        # simpler:
-        json_line = self.read_file.readline().strip()  # if strip is used to remove \n then why we dont put strip also in load_index also may be bcz there we use length find concept if yes then why we dont use that also here may be bcz we are coming here directly through offset value and not going back to get length
-        
-        # _load_index() → uses length-based reading, so NO strip.
-        # get() → reads whole line, so strip is OK.
-        # And YES — in get() we do NOT go back to read length, we rely on offset.
-        
-        record = json.loads(json_line)
-    
-        value = record["value"]
-        self.cache.put(key, value)
-    
-        return value
-
-    def stats(self):
-        return {
-            "file_size_bytes": os.path.getsize(self.filename),
-            "keys_in_index": len(self.index),
-            "keys_in_cache": len(self.cache.cache),
-            "put_count": self.put_count,
-            "delete_count": self.delete_count,
-            "last_compaction_time": self.last_compaction_time,
-        }
-
-    def print_cache(self):
-        print("LRU Cache contents:")
-        for key, value in self.cache.cache.items():
-            print(f"{key} -> {value}")
